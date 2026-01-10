@@ -1,28 +1,28 @@
 #!/bin/bash
-
-# Build script for clay_bar
-# This script handles the compilation with proper flags and libraries
-
 set -e
 
 echo "Building clay_bar..."
 
-# Check if required files exist
 if [ ! -f "clay_bar.c" ]; then
     echo "Error: clay_bar.c not found in current directory"
     exit 1
 fi
 
-# Compile with appropriate flags
-gcc -O2 -Wall -Wextra -std=c99 \
+# Compile
+gcc -O2 -Wall -Wextra -std=gnu99 \
+    -D_POSIX_C_SOURCE=200809L -D_GNU_SOURCE \
     -o clay_bar \
     clay_bar.c \
-    -lX11 -lcairo -lm
+    -lX11 -lXext -lcairo -lm
 
-if [ $? -eq 0 ]; then
-    echo "Build successful! Executable: clay_bar"
-    echo "Usage: ./clay_bar"
-else
-    echo "Build failed!"
-    exit 1
-fi
+echo "Build successful!"
+
+# Install to /usr/bin (requires sudo)
+echo "Installing to /usr/bin..."
+
+sudo rm /usr/bin/clay_bar
+sudo cp clay_bar /usr/bin/
+sudo chmod 755 /usr/bin/clay_bar
+sudo rm clay_bar
+
+echo "Installation complete. You can now run 'clay_bar' from anywhere."
