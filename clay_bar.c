@@ -1,8 +1,7 @@
 /*
- * clay_bar_minimal.c
+ * clay_bar.c
  *
  * Minimal working status bar using X11 + Cairo
- * No Pango/GLib dependencies
  */
 
 #define _XOPEN_SOURCE 700
