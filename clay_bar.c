@@ -20,6 +20,7 @@
 #include <X11/Xutil.h>
 #include <cairo/cairo.h>
 #include <cairo/cairo-xlib.h>
+#include <pango/pangocairo.h>
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -51,9 +52,19 @@ static pid_t spawn_cmd(char *const argv[]) {
     } else if (pid > 0) {
         return pid;
     } else {
+        perror("fork");
         return -1;
     }
 }
+
+/* ------------------------------------------------------------------
+   Constants and Configuration
+   ------------------------------------------------------------------ */
+static const int BAR_HEIGHT = 26;
+static const int REFRESH_INTERVAL_MS = 500;  /* 0.5 seconds */
+static const int SLEEP_INTERVAL_US = 10000; /* 10ms */
+static const char *DEFAULT_TERMINAL[] = { "xterm", NULL };
+static const char *DEFAULT_FILE_MANAGER[] = { "xdg-open", ".", NULL };
 
 /* ------------------------------------------------------------------
    Global state for the bar
@@ -63,10 +74,12 @@ static int screen_num = 0;
 static Window rootwin;
 static Window barwin;
 static int screen_w = 0, screen_h = 0;
-static const int BAR_HEIGHT = 26;
 
 static cairo_surface_t *surf = NULL;
 static cairo_t *cr = NULL;
+/* Pango objects (used for measuring and optional global context) */
+static PangoFontMap *pango_fontmap = NULL;
+static PangoContext *pango_context = NULL;
 
 /* Clay arena memory */
 static void *clay_mem = NULL;
@@ -79,16 +92,54 @@ static int dropdown_open = 0;
 static char timebuf[64] = {0};
 static char statusbuf[512] = {0};
 
-/* simple approximated text measuring function for Clay
-   NOTE: Clay expects a function: Clay_Dimensions MyMeasureText(Clay_StringSlice s, Clay_TextElementConfig *cfg, uintptr_t userData)
-   We'll use a crude width estimate: fontSize * 0.55 * length (monospaced-ish heuristic).
-*/
+
 static Clay_Dimensions measure_text_fn(Clay_StringSlice s, Clay_TextElementConfig *cfg, uintptr_t userData) {
-    (void)userData;
-    float font_size = (cfg ? (float)cfg->fontSize : 12.0f);
-    float approx_width = (float)s.length * (font_size * 0.55f) + (cfg ? cfg->letterSpacing : 0);
-    float approx_height = cfg ? (float)cfg->fontSize : font_size;
-    return (Clay_Dimensions){ .width = approx_width, .height = approx_height };
+    /* userData will contain a PangoContext* (passed during registration) */
+    PangoContext *ctx = (PangoContext *) (uintptr_t) userData;
+    if (!ctx) {
+        /* fallback conservative estimate */
+        float fs = cfg ? (float)cfg->fontSize : 12.0f;
+        return (Clay_Dimensions){ .width = (float)s.length * (fs * 0.55f), .height = fs };
+    }
+
+    /* create a temporary PangoLayout using the provided context */
+    PangoLayout *layout = pango_layout_new(ctx);
+    if (!layout) {
+        float fs = cfg ? (float)cfg->fontSize : 12.0f;
+        return (Clay_Dimensions){ .width = (float)s.length * (fs * 0.55f), .height = fs };
+    }
+
+    /* convert Clay_StringSlice to NUL-terminated UTF-8 */
+    size_t n = (size_t)s.length;
+    char *tmp = malloc(n + 1);
+    if (!tmp) {
+        g_object_unref(layout);
+        float fs = cfg ? (float)cfg->fontSize : 12.0f;
+        return (Clay_Dimensions){ .width = (float)s.length * (fs * 0.55f), .height = fs };
+    }
+    memcpy(tmp, s.chars, n);
+    tmp[n] = '\0';
+
+    /* Build a font description from cfg->fontSize (and optional family if you add it) */
+    PangoFontDescription *desc = pango_font_description_new();
+    /* optionally set family:
+       pango_font_description_set_family(desc, "Sans");
+    */
+    int pango_size = (int)((cfg && cfg->fontSize > 0.0f) ? (cfg->fontSize * PANGO_SCALE) : (12 * PANGO_SCALE));
+    pango_font_description_set_size(desc, pango_size);
+    pango_layout_set_font_description(layout, desc);
+
+    /* set text and measure */
+    pango_layout_set_text(layout, tmp, -1);
+    int width_px = 0, height_px = 0;
+    pango_layout_get_pixel_size(layout, &width_px, &height_px);
+
+    /* cleanup */
+    pango_font_description_free(desc);
+    free(tmp);
+    g_object_unref(layout);
+
+    return (Clay_Dimensions){ .width = (float)width_px, .height = (float)height_px };
 }
 
 /* error handler for Clay */
@@ -121,8 +172,17 @@ static void init_clay(int width, int height) {
     Clay_Initialize(clay_arena, (Clay_Dimensions){ .width = (float)width, .height = (float)BAR_HEIGHT },
                     (Clay_ErrorHandler)clay_error_handler);
 
-    /* register measure text function (userData NULL) */
-    Clay_SetMeasureTextFunction((Clay_MeasureTextFunction)measure_text_fn, 0);
+/* create a Pango context for measurement (fontmap/context lifetime managed by us) */
+pango_fontmap = pango_cairo_font_map_get_default();
+if (pango_fontmap) {
+    /* create a PangoContext from the fontmap */
+    pango_context = pango_font_map_create_context(pango_fontmap);
+} else {
+    pango_context = NULL;
+}
+
+/* register the measure function with Clay, passing pango_context as userData */
+Clay_SetMeasureTextFunction((Clay_MeasureTextFunction)measure_text_fn, (uintptr_t)pango_context);
 }
 
 /* helper to fetch root window name (dwm status typically updated there) */
@@ -336,25 +396,48 @@ static void render_clay_with_cairo(void) {
         } break;
         case CLAY_RENDER_COMMAND_TYPE_TEXT: {
             Clay_TextRenderData *tr = &cmd->renderData.text;
-            /* simple draw: set font face and draw at (x, y + ascent) */
-            double font_size = (double)tr->fontSize;
-            cairo_select_font_face(cr, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
-            cairo_set_font_size(cr, font_size);
-            cairo_text_extents_t ext;
-            /* We must convert Clay_StringSlice to a NUL-terminated string for cairo_show_text */
+
+            /* create a PangoLayout tied to this cairo context */
+            PangoLayout *layout = pango_cairo_create_layout(cr);
+            if (!layout) break;
+
+             /* convert Clay_StringSlice to NUL-terminated UTF-8 */
             size_t n = (size_t)tr->stringContents.length;
             char *tmp = malloc(n + 1);
-            if (!tmp) break;
+            if (!tmp) { g_object_unref(layout); break; }
             memcpy(tmp, tr->stringContents.chars, n);
             tmp[n] = '\0';
-            cairo_text_extents(cr, tmp, &ext);
-            double text_x = x + 2.0; /* tiny padding */
-            double text_y = y + ((double)h + ext.height) / 2.0 - ext.y_bearing;
+
+            /* set text on layout */
+            pango_layout_set_text(layout, tmp, -1);
+
+            /* set font description from tr->fontSize */
+            PangoFontDescription *desc = pango_font_description_new();
+            int pango_size = (int)( (tr->fontSize > 0.0f ? tr->fontSize : 12.0f) * PANGO_SCALE );
+            pango_font_description_set_size(desc, pango_size);
+            /* optional: set family: pango_font_description_set_family(desc, "Sans"); */
+            pango_layout_set_font_description(layout, desc);
+
+            /* compute vertical alignment: Pango returns pixel extents */
+            int pw = 0, ph = 0;
+            pango_layout_get_pixel_size(layout, &pw, &ph);
+
+            double text_x = x + 2.0; /* small left padding inside element */
+            double text_y = y + ((double)h - (double)ph) / 2.0; /* center vertically */
+
+            /* set color */
             cairo_set_source_rgba(cr, tr->textColor.r/255.0, tr->textColor.g/255.0, tr->textColor.b/255.0, tr->textColor.a/255.0);
+
+            /* draw */
             cairo_move_to(cr, text_x, text_y);
-            cairo_show_text(cr, tmp);
+            pango_cairo_show_layout(cr, layout);
+
+            /* cleanup */
+            pango_font_description_free(desc);
             free(tmp);
+            g_object_unref(layout);
         } break;
+
         default:
             /* ignore other types for now */
             break;
@@ -384,7 +467,11 @@ int main(int argc, char **argv) {
     struct sigaction sa;
     memset(&sa, 0, sizeof(sa));
     sa.sa_handler = SIG_IGN;
-    sigaction(SIGCHLD, &sa, NULL);
+    sa.sa_flags = SA_NOCLDSTOP | SA_RESTART;
+    if (sigaction(SIGCHLD, &sa, NULL) == -1) {
+        perror("sigaction");
+        return 1;
+    }
 
     dpy = XOpenDisplay(NULL);
     if (!dpy) {
@@ -435,7 +522,7 @@ int main(int argc, char **argv) {
                 render_clay_with_cairo();
             } else if (ev.type == ConfigureNotify) {
                 XConfigureEvent *ce = &ev.xconfigure;
-                if (ce->width != screen_w) {
+                if (ce->width != screen_w && ce->width > 0) {
                     screen_w = ce->width;
                     /* resize cairo surface */
                     cairo_xlib_surface_set_size(surf, screen_w, BAR_HEIGHT);
@@ -445,34 +532,37 @@ int main(int argc, char **argv) {
                 }
             } else if (ev.type == ButtonPress) {
                 XButtonEvent *b = &ev.xbutton;
-                /* translate y coordinates relative to bar top */
-                int mx = b->x;
-                int my = b->y;
-                /* if clicked in our menu toggle region, toggle dropdown */
-                if (point_in_element("menu_toggle", mx, my)) {
-                    dropdown_open = !dropdown_open;
-                    render_clay_with_cairo();
-                } else if (dropdown_open) {
-                    /* test if clicked item1 or item2 */
-                    if (point_in_element("item1", mx, my)) {
-                        /* spawn xterm */
-                        char *term[] = { "xterm", NULL };
-                        spawn_cmd(term);
-                        dropdown_open = 0;
+                /* validate button event */
+                if (b->button == Button1) { /* Only handle left mouse button */
+                    /* translate y coordinates relative to bar top */
+                    int mx = b->x;
+                    int my = b->y;
+                    /* if clicked in our menu toggle region, toggle dropdown */
+                    if (point_in_element("menu_toggle", mx, my)) {
+                        dropdown_open = !dropdown_open;
                         render_clay_with_cairo();
-                    } else if (point_in_element("item2", mx, my)) {
-                        /* spawn xdg-open . */
-                        char *args[] = { "xdg-open", ".", NULL };
-                        spawn_cmd(args);
-                        dropdown_open = 0;
-                        render_clay_with_cairo();
+                    } else if (dropdown_open) {
+                        /* test if clicked item1 or item2 */
+                        if (point_in_element("item1", mx, my)) {
+                            /* spawn xterm */
+                            char *term[] = { "xterm", NULL };
+                            spawn_cmd(term);
+                            dropdown_open = 0;
+                            render_clay_with_cairo();
+                        } else if (point_in_element("item2", mx, my)) {
+                            /* spawn xdg-open . */
+                            char *args[] = { "xdg-open", ".", NULL };
+                            spawn_cmd(args);
+                            dropdown_open = 0;
+                            render_clay_with_cairo();
+                        } else {
+                            /* click elsewhere closes dropdown */
+                            dropdown_open = 0;
+                            render_clay_with_cairo();
+                        }
                     } else {
-                        /* click elsewhere closes dropdown */
-                        dropdown_open = 0;
-                        render_clay_with_cairo();
+                        /* click outside -- ignore */
                     }
-                } else {
-                    /* click outside -- ignore */
                 }
             } else if (ev.type == ButtonRelease) {
                 /* ignore */
@@ -500,5 +590,9 @@ int main(int argc, char **argv) {
     XDestroyWindow(dpy, barwin);
     XCloseDisplay(dpy);
     free(clay_mem);
+    if (pango_context) g_object_unref(pango_context);
+    if (pango_fontmap) g_object_unref(pango_fontmap);
+    pango_context = NULL;
+    pango_fontmap = NULL;
     return 0;
 }
