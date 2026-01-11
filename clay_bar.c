@@ -13,7 +13,6 @@
 
 #define _XOPEN_SOURCE 700
 #define _POSIX_C_SOURCE 200809L
-#define _GNU_SOURCE
 
 #include <X11/Xlib.h>
 #include <X11/extensions/shape.h>
@@ -34,7 +33,7 @@ static const int H_PADDING = 7;
 static const int V_PADDING = 3;
 static const int FG_R = 220, FG_G = 220, FG_B = 220;
 static const double FG_A = 1.0;
-static const double REFRESH_INTERVAL = 60.0;
+static const double REFRESH_INTERVAL = 1.0;
 /* ---------------------------- */
 
 static Display *dpy = NULL;
@@ -56,7 +55,7 @@ static void update_time(void) {
     time_t t = time(NULL);
     struct tm tm;
     localtime_r(&t, &tm);
-    strftime(timebuf, sizeof(timebuf), "%a/%-d %I:%M%p", &tm);
+    strftime(timebuf, sizeof(timebuf), "%a/%-d %I:%M:%S %p ", &tm);
 }
 
 /* Ensure Cairo surface matches window size */
