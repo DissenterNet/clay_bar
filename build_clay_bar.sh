@@ -18,11 +18,8 @@ gcc -O2 -Wall -Wextra -std=gnu99 \
 echo "Build successful!"
 
 # Install to /usr/bin (requires sudo)
-echo "Installing to /usr/bin..."
-
 sudo rm /usr/bin/clay_bar
 sudo cp clay_bar /usr/bin/
 sudo chmod 755 /usr/bin/clay_bar
 sudo rm clay_bar
-
-echo "Installation complete. You can now run 'clay_bar' from anywhere."
+echo "Installation complete."
