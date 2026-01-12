@@ -33,7 +33,7 @@ static const int H_PADDING = 7;
 static const int V_PADDING = 3;
 static const int FG_R = 220, FG_G = 220, FG_B = 220;
 static const double FG_A = 1.0;
-static const double REFRESH_INTERVAL = 1.0;
+static const double REFRESH_INTERVAL = 0.1;
 /* ---------------------------- */
 
 static Display *dpy = NULL;
