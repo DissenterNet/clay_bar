@@ -22,4 +22,4 @@ sudo rm /usr/bin/clay_bar
 sudo cp clay_bar /usr/bin/
 sudo chmod 755 /usr/bin/clay_bar
 sudo rm clay_bar
-echo "Installation complete."
+echo "Installation complete."\
